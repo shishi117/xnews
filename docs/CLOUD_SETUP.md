@@ -109,7 +109,13 @@ GitHubのリポジトリ画面 → **Settings** → 左メニュー **Secrets an
 
 ---
 
-## 5. Cloudflare Pagesでビューアを公開する
+## 5. Cloudflare Pages（Workers統合後の経路）でビューアを公開する
+
+★2026年時点のCloudflareは「Pages」がダッシュボード上の見た目としては残っていても、
+実際のデプロイは統合後の **Workers** の仕組み（`wrangler deploy`）を通ることがある。
+この場合、ダッシュボードの「Build output directory」欄だけでは経路を制御しきれず、
+リポジトリ直下に **`wrangler.jsonc`** を置いて `assets.directory` で静的ファイルの
+場所を明示する必要がある（このプロジェクトには追加済み。§5-3）。
 
 1. Cloudflareダッシュボード → **Workers & Pages** → **Create** → **Pages** →
    **Connect to Git** で、先ほどのGitHubリポジトリ（xnews）を選ぶ。
@@ -117,17 +123,33 @@ GitHubのリポジトリ画面 → **Settings** → 左メニュー **Secrets an
 2. ビルド設定は次の通り（このプロジェクトはビルド不要な静的ファイルのため）。
    - **Build command**: `exit 0`（空欄のままだとフレームワーク自動検出が走って
      失敗することがあるため、「何もしない」ことを明示するコマンドを入れる）
-   - **Build output directory**: `.`（リポジトリのルート。`/`ではなく **ドット1文字**。
-     `/`を指定すると `Could not detect a directory containing static files` で
-     デプロイが失敗する。`web/`と`data/`を両方とも同じ相対関係のまま公開する必要が
-     あるため、サブフォルダではなくルート＝`.`を指定する）
-3. **Save and Deploy** を押すとデプロイが始まる。数十秒〜数分で
-   `https://xnews-xxxx.pages.dev/web/db_viewer.html` のようなURLが発行される。
-4. 一度アクセスして、ビューアが（現時点ではまだ誰でも見える状態で）正しく
-   表示されることを確認する。表示されない場合は「Build output directory」が
-   `.`になっているか（`/`のままになっていないか）を見直す。
-5. 以後、GitHub Actionsが`data/news_data.js`等を更新してpushするたびに、
-   Cloudflare Pagesが自動で再デプロイする（追加の作業は不要）。
+   - **Build output directory**: `.`（ドット1文字。`/`は不可）
+3. **wrangler.jsonc をリポジトリ直下に置く**（このプロジェクトには既に追加済み）。
+   デプロイログが `Executing user deploy command: npx wrangler deploy` になっている
+   場合、この設定ファイルが無いと `Could not detect a directory containing static files`
+   で失敗する（ダッシュボードのBuild output directoryはこの経路では見られていない）。
+   ```jsonc
+   {
+     "name": "xnews-viewer",
+     "compatibility_date": "2026-09-01",
+     "assets": { "directory": "." }
+   }
+   ```
+   **`name`はCloudflareダッシュボードで実際に作られているプロジェクト名と一致させること**
+   （手順1で作成したプロジェクトの名前。ダッシュボードの概要ページ・URLで確認できる）。
+   一致していないとうまく紐付かない可能性があるので、初回デプロイ後にログを見て、
+   想定した名前・URLでデプロイされているか必ず確認する。
+4. **Save and Deploy**（またはGitHub Actions経由のpush）でデプロイが走る。数十秒〜数分で
+   `https://xnews-viewer.<アカウント名>.workers.dev/web/db_viewer.html` のような
+   URLが発行される（統合後の経路では `.pages.dev` ではなく `.workers.dev` ドメインに
+   なることがある。実際に発行されたURLはCloudflareダッシュボードの概要ページで確認する）。
+5. 一度アクセスして、ビューアが（現時点ではまだ誰でも見える状態で）正しく表示される
+   ことを確認する。表示されない場合は3のwrangler.jsonc、2のBuild設定を見直す。
+   ★既定（`html_handling: auto-trailing-slash`）では `/web/db_viewer.html` に直接
+   アクセスすると `/web/db_viewer`（拡張子なし）へ307リダイレクトされてから表示される。
+   見た目上URLから`.html`が消えるだけで、表示自体は問題ない。
+6. 以後、GitHub Actionsが`data/news_data.js`等を更新してpushするたびに、
+   自動で再デプロイする（追加の作業は不要）。
 
 ---
 
@@ -167,9 +189,9 @@ Zero Trust → **Access** → **Applications** → **Add an application** →
 
 - **Application name**: 任意（例: `xnews viewer`）
 - **Session duration**: 好みで（例: 24h。ログインし直す頻度が決まる）
-- **Application domain**: Cloudflare Pagesで発行されたドメイン
-  （例: `xnews-xxxx.pages.dev`。パスを絞りたい場合は `xnews-xxxx.pages.dev/web/db_viewer.html`
-  のように指定することもできる）
+- **Application domain**: 手順5で実際に発行されたドメイン（`.pages.dev` または
+  `.workers.dev`。ダッシュボードの概要ページで確認する）。パスを絞りたい場合は
+  `<発行されたドメイン>/web/db_viewer.html` のように指定することもできる
 
 ### 6-4. ポリシーを作る（許可するアカウントを指定）
 
@@ -207,10 +229,10 @@ Zero Trust → **Access** → **Applications** → **Add an application** →
 | Actionsの最後のステップで push が失敗する（Permission denied 等） | 手順3の「Workflow permissions」が Read and write になっているか |
 | メールが届かない | Secretsの `GMAIL_USER` / `GMAIL_APP_PASSWORD` / `MAIL_TO` の値、特にアプリパスワードの桁数（16文字）を確認 |
 | financialjuice/DeItaoneが `(guest)` のまま | Secretsの `X_AUTH_TOKEN` / `X_CT0` が正しく登録されているか（`docs/auth-session-setup.md`） |
-| Cloudflare Pagesのデプロイが `Could not detect a directory containing static files` で失敗する | 「Build output directory」に `/` を指定していないか。**`.`（ドット1文字）** に直す |
+| Cloudflare Pagesのデプロイが `Could not detect a directory containing static files` で失敗する | デプロイログが `npx wrangler deploy` になっている場合、リポジトリ直下に `wrangler.jsonc`（`assets.directory: "."`）があるか確認する（§5-3）。無ければ追加してpush。あわせて「Build output directory」が `/` ではなく `.` になっているかも確認 |
 | Cloudflare Pagesのビューアが真っ白 | 「Build output directory」が `.` になっているか。`data/news_data.js` がリポジトリに存在し、Actionsが実際にpushしているか |
 | メール送信が `555 5.5.2 Syntax error` で失敗する（Gmail側の分かりにくいエラー） | 原因は大抵 `GMAIL_USER`/`MAIL_TO` の値が「メールアドレスに見えない」こと（全角＠・全角スペース・コピペ時の改行混入・余分なカンマなど）。この不具合を検知して、次回実行時からは代わりに `メール設定の値がメールアドレスの形式に見えません: ...`という具体的なエラーが出るようにした（文字数と原因カテゴリを表示）。そのSecretを一度削除し、余分な文字が入らないよう再登録する |
-| Googleログイン画面が出ずに直接見えてしまう | Accessアプリケーションの「Application domain」がCloudflare Pagesの実際のドメインと一致しているか |
+| Googleログイン画面が出ずに直接見えてしまう | Accessアプリケーションの「Application domain」が実際に発行されたドメイン（`.pages.dev`/`.workers.dev`）と一致しているか |
 | Googleログインが失敗する（redirect_uri_mismatch等） | Google Cloud Console側のリダイレクトURIとCloudflareが提示するコールバックURLが完全に一致しているか |
 | リポジトリのサイズが気になってきた | `data/`配下は保持期間(7日)分しか無いため1回あたりは小さいが、pushのたびに履歴が積み上がる。当面は無料枠内で問題ないが、気になれば数か月おきに履歴を整理（squash）してもよい |
 
