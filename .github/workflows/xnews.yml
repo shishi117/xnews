@@ -1,0 +1,64 @@
+# Xニュース収集ツールを毎日1回、GitHub Actionsで自動実行するワークフロー。
+# 手順・前提（Cloudflare Pages / Access の設定含む）は docs/CLOUD_SETUP.md を参照。
+name: xnews collect & mail
+
+on:
+  # 08:13 JST（=前日23:13 UTC）に1日1回実行。ぴったり0分だと混雑しやすいので数分ずらしてある。
+  # --window 24（下のrunで指定）で「実行時刻から遡って24時間」を集めるため、
+  # GitHub Actionsのスケジュール実行が数分〜数十分ずれても取りこぼしにはならない
+  # （ズレた分だけ前回と重複する期間が増えるだけ。重複はtweet_idで自動的に弾かれる）。
+  schedule:
+    - cron: "13 23 * * *"
+  # Actionsタブから手動実行できるようにする（動作確認・不具合時の再実行用）
+  workflow_dispatch: {}
+
+# 前の実行が終わる前に次が始まって、data/配下への git push が競合するのを防ぐ。
+# cancel-in-progressはfalseにして、手動実行が定期実行を握りつぶさないようにする。
+concurrency:
+  group: xnews-run
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # data/news_log.db 等をコミットして次回実行に状態を引き継ぐため必須
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: リポジトリを取得
+        uses: actions/checkout@v4
+
+      - name: Pythonをセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 依存関係をインストール
+        run: pip install -r requirements.txt
+
+      - name: 収集 → 翻訳 → メール送信 → ビューア用JSON生成
+        env:
+          # ここに書いてあるのは「参照先」の名前だけで、値そのものは含まれない。
+          # secrets.XXX は Settings > Secrets and variables > Actions に登録した値
+          # （登録手順は docs/CLOUD_SETUP.md）。x_collector.py 側は config.ini が
+          # 無い場合、この環境変数名を直接読みにいく（secret()関数）。
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          X_AUTH_TOKEN: ${{ secrets.X_AUTH_TOKEN }}
+          X_CT0: ${{ secrets.X_CT0 }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python src/x_collector.py --window 24
+
+      - name: 収集結果をコミット（次回実行への引き継ぎ・ビューア更新）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/news_log.db data/state.json data/news_data.js
+          if git diff --cached --quiet; then
+            echo "[*] 変更なし（新規投稿0件など）。コミットをスキップします。"
+          else
+            git commit -m "chore: xnewsデータ更新 ($(date -u +'%Y-%m-%dT%H:%M:%SZ'))"
+            git push
+          fi

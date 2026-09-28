@@ -22,7 +22,11 @@ X（Twitter）の英語ニュース速報アカウント2件から、当人の�
   - **引き換えに、投稿の原文がGroqへ送信される**（収集対象は公開投稿だが、
     「全ローカル」ではなくなった点は認識しておくこと）。
 - 秘密情報（メールのアプリパスワード・Xの捨て垢セッション）は **`config/config.ini` に集約**。
-  システム環境変数は使わない。
+  ローカル運用ではこれで完結する。
+  - **クラウド運用（GitHub Actions）の場合は例外的に環境変数を使う**（`secret()`関数、§10）。
+    config.iniをリポジトリに置けないため、config.iniの値が無いときだけ同名の環境変数
+    （GitHub Secretsから渡される）にフォールバックする。ローカル運用には影響しない。
+    手順は `docs/CLOUD_SETUP.md`。
 
 ```
 python src/x_collector.py
@@ -32,7 +36,8 @@ python src/x_collector.py
             ├ ④ 保持期間(7日)超過の削除
             ├ ⑤ ラベルの表記ゆれ統一（Groq・DB全体が対象）
             ├ ⑥ HTMLメール送信（Gmail SMTP）
-            └ ⑦ db_viewer.html をローカルHTTPサーバ経由で自動オープン
+            └ ⑦ DBをJSON化してdata/news_data.jsへ書き出し、db_viewer.htmlをfile://で自動オープン
+                （サーバは使わない。§8・§9）
 ```
 
 一連の流れは `run.bat` が①〜⑦をまとめて実行する。
@@ -266,20 +271,26 @@ python src/x_collector.py
 
 ## 8. db_viewer.html 仕様
 
-- `news_log.db` の中身をブラウザで一覧・検索・絞り込みできる単一HTMLファイル。
-- 生成時に件数と最新日時をログに出す（`[*] db_snapshot.js を更新: N 件（最新 …）`）。
-  「書けたつもりで古いまま」を検知できるようにするため。
-- SQLiteの読み込みは `sql.js`（SQLiteのWebAssembly版）を丸ごと埋め込み、
-  **完全にオフラインで動作**（wasm本体もbase64で同梱）。
-- **読み込み元は `news_log.db` に固定**（ファイル選択ボタンは廃止）。開き方で経路が変わる：
-  - **HTTP経由**（`x_collector.py` が起動するローカルサーバ `http://localhost:8765/web/db_viewer.html`）
-    … 相対パス `../data/news_log.db` を直接fetch。**常に最新**。
-  - **`file://` で直接開いた場合** … ブラウザはローカルファイルのfetchを禁止しているため、
-    `x_collector.py` が書き出した `data/db_snapshot.js`（DBをbase64で埋めた生成物）を
-    `<script>` タグ経由で読む。**前回実行時点のデータ**になる。
-    `<script>` の読み込みはfetchと違いブロックされないことを利用している。
+- `news_log`/`news_labels` の中身をブラウザで一覧・検索・絞り込みできる単一HTMLファイル。
+- ★2026/09時点、**ローカルサーバは廃止**した。`file://` で直接ダブルクリックして開く
+  運用に一本化している（旧版は `http.server` を裏で起動していたが、`config/config.ini` を
+  含むプロジェクトルート全体を全インターフェースへ配信してしまう問題があったため、
+  「サーバを立てない」設計に変更した＝この問題自体が構造的に解消される）。
+- **読み込み元はSQLiteではなくJSON**（`data/news_data.js`）に変更した。
+  `x_collector.py` が `news_log`/`news_labels` を tweet_idごとに
+  `{tweet_id, created_at, source, translation, summary, url, labels:{軸:[値,...]}}` へ組み立て、
+  `window.__NEWS_ITEMS = [...]` という形で書き出す（`build_viewer_items`/`write_viewer_data`）。
+  - `file://` はブラウザの `fetch` によるローカルファイル読み込みを禁止するが、
+    `<script src="...">` の読み込みは禁止されない。この性質を使い、
+    `news_data.js` を素の `.js` ファイルとして `<script>` タグで読み込む
+    （以前はSQLite本体をbase64にして同じ手法で読んでいたが、ブラウザ側でSQLを実行する
+    必要が無いのでJSONへ単純化し、あわせて `sql.js`（SQLiteのWASM実装）の埋め込みも
+    丸ごと削除した＝db_viewer.html自体が約945KB→約18KBまで小さくなった）。
+  - 読み込み経路は**この1本のみ**（`file://` 直開き固定・ファイル選択ボタンは無い）。常に
+    「最後に `x_collector.py` を実行した時点」のデータになる（サーバが無いので
+    ブラウザを開いたまま自動更新はされない。最新を見るには再実行してから開き直す）。
 - 1軸に複数値がある場合、バッジは値ごとに1つ表示し、絞り込みは「その値を含む記事」を拾う。
-- 軸ごとの絞り込みは **DBの中身から動的に生成**（`LABEL_AXES` を変えても
+- 軸ごとの絞り込みは **データの中身から動的に生成**（`LABEL_AXES` を変えても
   db_viewer.html自体の編集は不要）。値ごとの件数も表示する。
 - **1つの軸で複数の値を選べる**。軸ごとに `いずれか(OR)` / `すべて(AND)` を切り替えられる。
   - `OR` … 選んだ値のどれかを持つ記事（例: 国・地域が「米国」または「中国」）
@@ -295,30 +306,24 @@ python src/x_collector.py
 - **絞り込み条件・検索語・並び順はブラウザに保存**され（`localStorage`）、次に開いたとき
   その条件で表示される。「フィルタをクリア」で全解除。
   - 保存に使うキーは `xnews_db_viewer_filters_v1`。
-  - ★**`file://` で開いたときとHTTP経由で開いたときでは保存先が別**になる
-    （ブラウザがオリジンごとに分離するため）。条件は共有されない。
-  - 保存済みの値がDBから消えている場合（軸や値を変えた後）は、その値だけ黙って捨てる。
+  - 保存済みの値がデータから消えている場合（軸や値を変えた後）は、その値だけ黙って捨てる。
     保存内容が壊れている場合は「条件なし」で開く。
   - プライベートウィンドウ等で保存できない場合は、画面右に
     「条件を保存できません（ブラウザ設定）」と出るが、絞り込み自体は動く。
+- JSでのDOM操作・フィルタ・保存の一連の挙動は、jsdom（Node.js上で動く実際のDOM実装）で
+  `db_viewer.html` をそのまま読み込んで検証している（手書きDOMスタブでは
+  `innerHTML=""` の子要素削除などの挙動を見逃したことがあったため、実装の近い環境で確認する
+  方針にした）。
 
-## 9. db_viewer 自動起動（`ensure_db_viewer_server`）
+## 9. db_viewer の自動起動（`open_db_viewer`）
 
-- `http.server`（Python標準ライブラリ）を**バックグラウンドの別プロセス**として起動し、
-  プロジェクトルート（`BASE_DIR`）を配信し、`/web/db_viewer.html` を開く。ポートは `DB_VIEWER_PORT=8765`。
-- ★既知の問題: ルートを丸ごと配信しているため `config/config.ini` も配信対象に含まれる
-  （バインド先未指定＝全インターフェース待ち受け）。別途対応予定。
-- 起動前にそのポートの**中身まで確認**する（`/web/db_viewer.html` を取得し、
-  先頭の目印 `x-collector-db-viewer` があるか）。
-  - 我々のサーバなら新規起動せず開くだけ（日次実行のたびに増殖しない）。
-  - ★**別のプロセスが居座っていたら次の空きポートで立て直す**（`8765〜8774`）。
-    以前は「ポートが埋まっている＝我々のサーバ」と決めつけていたため、
-    **古い版のサーバが残っていると旧フォルダを配信し続け、db_viewerが表示されない**
-    状態になり得た。
-  - 目印は `db_viewer.html` の先頭付近に置くこと。後ろにあると判定の読み取り範囲に
-    入らず、自分のサーバを別物と誤判定して実行のたびにポートが増える。
-- サーバはメール送信後も動き続ける（意図的。ブラウジングのため）。プロセスを止めたい場合は
-  タスクマネージャー等で手動終了する。
+- メール送信後（成否問わず）、`write_viewer_data()` で `data/news_data.js` を最新化してから、
+  `webbrowser.open()` で `db_viewer.html` を **`file://` のURLとして直接開く**。
+  サーバプロセスは一切起動しない。
+- ★旧版にあった「ポートの空き確認」「別プロセスとの判別」「サーバの多重起動防止」は、
+  サーバそのものが無くなったことで**すべて不要**になった。
+- `--check-viewer` で `news_log.db` / `news_data.js` / `db_viewer.html` の3点の有無・件数を
+  確認できる（ポートは確認しない。確認するものが無いため）。
 
 ## 10. 主要設定一覧（`x_collector.py` 冒頭）
 
@@ -338,10 +343,23 @@ python src/x_collector.py
 | `LABEL_AXES` | 4軸（§6参照） | ラベリングの軸 |
 | `EMAIL_GROUP_BY` | `"国・地域"` | メールのセクション分け軸 |
 | `AUTH_HANDLES` | `{"financialjuice", "deitaone"}` | 捨て垢セッション必須のhandle |
-| `DB_VIEWER_PORT` | `8765` | db_viewer用ローカルサーバのポート |
+| `VIEWER_DATA_PATH` | `data/news_data.js` | db_viewer.html が読むJSON書き出し先（§8・サーバ廃止） |
 | `RETENTION_DAYS` | `7` | これより古い投稿はDBから削除 |
 | `NORMALIZE_CHUNK` | `15` | 1回のLLM呼び出しに渡す値の数（超過時は自動で分割再試行） |
 | `BASE_DIR` | `src/` の1つ上 | 各パスの基準（`config/`・`data/`・`web/` をここから解決） |
+
+秘密情報系（`MAIL_FROM`・`MAIL_APP_PASSWORD`・`MAIL_TO`・`LLM_API_KEY`・`X_AUTH_TOKEN`・
+`X_CT0`）は `secret(cfg, section, key, env_name)` で読む。config.iniの値があればそれを使い、
+無ければ環境変数`env_name`にフォールバックする。対応関係:
+
+| config.ini | 環境変数（GitHub Secrets名） |
+|---|---|
+| `[mail] gmail_user` | `GMAIL_USER` |
+| `[mail] gmail_app_password` | `GMAIL_APP_PASSWORD` |
+| `[mail] mail_to` | `MAIL_TO` |
+| `[llm] api_key` | `GROQ_API_KEY` |
+| `[x] auth_token` | `X_AUTH_TOKEN` |
+| `[x] ct0` | `X_CT0` |
 
 ## 11. ファイル構成
 
@@ -352,14 +370,16 @@ python src/x_collector.py
 | `src/x_collector.py` | 本体（収集・保存・翻訳・メール・db_viewer起動） |
 | `config/config.ini` | 秘密情報（メール・捨て垢セッション）※Gitに入れない |
 | `config/config.example.ini` | config.ini の見本（値は空） |
-| `web/db_viewer.html` | DB閲覧用（sql.js同梱・オフライン動作） |
+| `web/db_viewer.html` | DB閲覧用（サーバ不要・`file://` 直開き。JSON読み込みのみで完結） |
 | `scripts/venv.bat` / `scripts/req.bat` | 仮想環境 `env` の作成 / 依存関係のインストール |
 | `scripts/test_mail.py` | メール送信だけを切り分けて検証する診断スクリプト |
 | （疎通確認） | `python src\x_collector.py --test-llm` でGroqに1回だけ投げる |
 | `docs/auth-session-setup.md` | 捨て垢セッションの取得手順（詳細） |
 | `data/state.json` | 実行時に自動生成。アカウントごとの `last_seen_id` |
-| `data/news_log.db` | 実行時に自動生成。収集データ本体 |
-| `data/db_snapshot.js` | 実行時に自動生成。`file://` で db_viewer を開いたとき用のDBスナップショット |
+| `data/news_log.db` | 実行時に自動生成。収集データ本体（SQLite） |
+| `data/news_data.js` | 実行時に自動生成。db_viewer.html が読むJSON（§8） |
+| `.github/workflows/xnews.yml` | GitHub Actionsでの自動実行定義（クラウド運用時のみ使う。§14） |
+| `docs/CLOUD_SETUP.md` | クラウド運用（GitHub Actions + Cloudflare）のセットアップ手順 |
 
 ## 12. 自己テスト
 
@@ -393,8 +413,8 @@ XSSエスケープ・`config.ini` 読み込み・アプリパスワードのス�
   （以前はここで例外終了し、初回実行が何も残さず落ちていた）。
 - 全垢が捨て垢セッションで動く設定なら、ゲストトークンの取得自体を行わない。
 - 収集0件のときはメール送信も `db_viewer` 起動も行わない（`new_ids` が空のため）。
-- `db_viewer.html` をDB未生成の状態で開いた場合は、`file://` なら
-  「一度実行してください」、HTTP経由なら `HTTP 404` を画面に表示する（白画面にしない）。
+- `db_viewer.html` をデータ未生成の状態で開いた場合は
+  「一度実行してください」というメッセージを画面に表示する（白画面にしない）。
 
 ## 12.55 db_viewerが表示されないときの確認方法
 
@@ -402,9 +422,9 @@ XSSエスケープ・`config.ini` 読み込み・アプリパスワードのス�
 python src\x_collector.py --check-viewer
 ```
 
-- `news_log.db` / `db_snapshot.js` の件数と生成時刻（データが入っているか、古くないか）
+- `news_log.db` / `news_data.js` の件数と生成時刻（データが入っているか、古くないか）
 - `db_viewer.html` の有無
-- ポート `8765〜8767` の状態（`ours` / `別物` / `空き`）と、開くべきURL
+- サーバは使わない構成なので、ポートの確認は不要（§9）
 
 画面は出るのに0件のときは、**絞り込み条件がブラウザに残っている**可能性が高い
 （条件は `localStorage` に保存される仕様。§8）。db_viewer上部の「フィルタをクリア」を押す。
@@ -461,7 +481,38 @@ python src\x_collector.py --check-viewer
   `IMF` → `国際貨幣基金`（正しくは国際通貨基金）、`中国・米国` `米中` `韓国・米国` が
   分割されずに残る。**軸ごとの許可値リストを持たない限り、この種の誤りは残る**。
   ラベルは毎回上書きされるため、**統合前の値は残らない**。
-- `file://` で db_viewer を開いた場合のデータは `db_snapshot.js` の生成時点のもの。
-  常に最新を見たい場合はHTTP経由（`run.bat` 実行時に自動で開く方）を使う。
-- `data/db_snapshot.js` は `news_log.db` をbase64で丸ごと持つため、DBの約1.33倍の
-  サイズになる（保持期間7日で頭打ちになる想定）。
+- db_viewerで見えるデータは **`news_data.js` の生成時点のもの**（サーバを廃止したため
+  常時最新にはならない）。最新を見たい場合は `x_collector.py` を再実行してから
+  db_viewer.htmlを開き直す（開きっぱなしのタブは自動更新されない）。
+- **（クラウド運用時）GitHub Actionsのスケジュール実行は数分〜数十分ずれることがある**。
+  `--window 24` で毎回「実行時刻から遡って24時間」を集める設計にしているため、
+  多少のズレは前回分と重複するだけで取りこぼしにはならない（重複はtweet_idで自動的に除外）。
+  ただし実行そのものがスキップされる（GitHub側の障害等）と、その回だけ穴が空く可能性はある。
+- **（クラウド運用時）スケジュール実行は60日間リポジトリに動きが無いと自動停止する**仕様が
+  GitHubにあるが、本ワークフローは実行のたびに`data/`をコミットするため、通常運用していれば
+  この停止条件には当たらない。
+- **（クラウド運用時）`data/`配下を毎回コミットするため、リポジトリのサイズは実行のたびに
+  少しずつ増える**。1回あたりのデータ量は小さい（保持期間7日ぶんのみ）が、履歴は積み上がる。
+  無料枠内で長期間は問題ない想定だが、気になれば数か月おきに履歴を整理してもよい。
+
+## 14. クラウド運用（GitHub Actions + Cloudflare）
+
+ローカル（Windowsタスクスケジューラ）の代わりに、GitHub Actionsで毎日1回自動実行し、
+ビューアをCloudflare Pages + Access（Googleアカウント限定）で公開する構成。
+セットアップ手順は `docs/CLOUD_SETUP.md` に分離してある。要点のみここに記す。
+
+- 実行頻度は**1日1回**（既定: 08:13 JST）。`.github/workflows/xnews.yml` の `cron:` で変更可。
+- 時間帯指定（`--from`/`--to`）ではなく **`--window 24`**（実行時刻から遡って24時間）を使う。
+  1日1回の運用ではこちらのほうがスケジュールの多少のズレに強い（§13）。
+- 秘密情報は `config/config.ini` の代わりに **GitHub Secrets** に登録し、ワークフローが
+  環境変数として渡す（§10の対応表、`secret()`関数）。
+- 状態（`data/news_log.db`・`data/state.json`）とビューア用データ（`data/news_data.js`）は、
+  実行のたびにワークフローがリポジトリへコミット・pushして次回実行に引き継ぐ
+  （ローカル運用では`data/`はGit管理しないが、クラウド運用ではあえて管理する。
+  `.gitignore`参照）。
+- CI環境（`GITHUB_ACTIONS=true`）では `open_db_viewer()` はブラウザを起動しようとせず
+  自動でスキップする（§9）。ビューアはCloudflare Pagesの公開URLから見る運用のため。
+- ホスティング先はGitHub PagesではなくCloudflare Pages等を使う。GitHub PagesはPrivate
+  リポジトリの無料公開に対応していないため。
+- アクセス制限（Googleアカウント限定）はCloudflare Access（Zero Trust）側の設定であり、
+  アプリケーションコード側には手を入れていない。

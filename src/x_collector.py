@@ -16,7 +16,8 @@ X の指定アカウント（複数）から「本人オリジナル投稿の未
   - 翻訳＋ラベリング: Groq(クラウド・無料枠/OpenAI互換)で日本語訳と、LABEL_AXES に列挙した任意の軸
     （個数・内容は自由に変更可）を付与。news_labels テーブルに縦持ちで保存
   - 配信: Gmail SMTP + HTMLメール（GAS版 escapeHtml_ の順序を踏襲）
-  - メール送信後、db_viewer.html をローカルHTTPサーバ経由で自動的に開く
+  - メール送信後、DBの中身をJSON化して data/news_data.js に書き出し、db_viewer.html を
+    file:// で直接開く（サーバは使わない）
   - 耐障害: state.json はアトミック置換 / アカウントごとに独立 try/except / F6失敗検知
   - 自己チェック: ネットワーク不要の --selftest（分類・差分・保存・翻訳・HTML・XSS・config・
     ページネーション）
@@ -31,7 +32,7 @@ X の指定アカウント（複数）から「本人オリジナル投稿の未
              python src/x_collector.py --selftest      # オフライン自己テスト
              python src/x_collector.py --test-llm      # Groqへの疎通確認（1回だけ呼ぶ）
              python src/x_collector.py --list-models   # このキーで使えるモデル一覧
-             python src/x_collector.py --check-viewer  # db_viewerが出ないときの切り分け
+             python src/x_collector.py --check-viewer  # db_viewerが表示されないときの切り分け
   依存: curl_cffi（収集時のみ）。--selftest は標準ライブラリだけで走る。
   ★queryId/features は回転する。古いと 404/400。更新手順は本ファイル内コメント参照。
 """
@@ -41,12 +42,9 @@ import re
 import sys
 import json
 import time
-import socket
 import sqlite3
 import smtplib
 import webbrowser
-import subprocess
-import base64
 import configparser
 import urllib.request
 import urllib.error
@@ -78,10 +76,12 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 STORE_PATH = os.path.join(DATA_DIR, "news_log.db")
-# db_viewer を file:// で直接開いた場合、ブラウザは fetch でローカルの .db を読めない。
-# そこでDBの中身をbase64のJSファイルとして書き出し、db_viewer が <script> で読み込む。
-SNAPSHOT_PATH = os.path.join(DATA_DIR, "db_snapshot.js")
-DB_VIEWER_PORT = 8765          # メール送信後にdb_viewer.htmlを開くローカルサーバのポート
+# ★db_viewer.html はローカルサーバを使わず file:// で直接開く運用にした（サーバ廃止）。
+#   file:// はブラウザがfetchでのローカルファイル読み込みを禁止するため、DBの中身を
+#   tweet_idごとに組み立てたJSONとして書き出し、db_viewer が <script src> で読み込む
+#   （<script>読み込みはfile://でも禁止されない。以前はここにsqlite本体をbase64で
+#   埋め込んでいたが、ブラウザ側でSQLを実行する必要が無いのでJSONへ簡素化した）。
+VIEWER_DATA_PATH = os.path.join(DATA_DIR, "news_data.js")
 
 # ---- 翻訳＋ラベリング（Groq のクラウド推論。OpenAI互換）------------------------
 # ローカル(Ollama/Docker)はPC負荷が高すぎたため廃止し、Groqの無料枠に移行した。
@@ -114,15 +114,28 @@ NORMALIZE_MAX_LEN = 20    # 正規化後の値の最大文字数（超えたら�
 # ---- 保持期間（これより古い投稿はDBから削除する）--------------------------------
 RETENTION_DAYS = 7        # news_log.created_at(JST) 基準。news_labels も連動して削除
 
-# ---- 秘密情報: config.ini に集約（個人利用のためシステム環境変数は使わない）----------
+# ---- 秘密情報: config.ini（ローカル）または環境変数（GitHub Actions等クラウド）----------
 # プロジェクトルートの config/config.ini から読む。無い/項目欠損でも起動時に落とさず、
 # 該当機能だけ実行時にスキップ/警告（メール未設定→送信失敗を表示、X未設定→ゲストへ退避）。
+# ★クラウド運用（GitHub Actions）ではconfig.iniをリポジトリに置けない（秘密情報のため）。
+#   その場合はGitHub Secretsに登録した値がワークフロー実行時に環境変数として渡される。
+#   config.ini の値を優先し、無ければ同名の環境変数を見る（secret()）。ローカルでconfig.ini
+#   を使っている人には一切影響しない。環境変数名の対応は docs/CLOUD_SETUP.md 参照。
 CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.ini")
 
 
 def cfg_get(cfg, section, key):
     """configparserの薄いラッパー。値なし/セクションなしはすべて空文字に正規化。"""
     return cfg.get(section, key, fallback="").strip()
+
+
+def secret(cfg, section, key, env_name):
+    """config.ini の値を優先し、無ければ環境変数(env_name)にフォールバックする。
+    ローカル(config.ini)とGitHub Actions(Secrets→環境変数)の両方に対応するための薄い層。"""
+    v = cfg_get(cfg, section, key)
+    if v:
+        return v
+    return os.environ.get(env_name, "").strip()
 
 
 def load_config(path=CONFIG_PATH):
@@ -137,16 +150,16 @@ _CFG = load_config()
 # ---- メール（Gmail SMTP + アプリパスワード）----------------------------------
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
-MAIL_FROM = cfg_get(_CFG, "mail", "gmail_user")            # 例: you@gmail.com
-MAIL_APP_PASSWORD = cfg_get(_CFG, "mail", "gmail_app_password").replace(" ", "")
+MAIL_FROM = secret(_CFG, "mail", "gmail_user", "GMAIL_USER")            # 例: you@gmail.com
+MAIL_APP_PASSWORD = secret(_CFG, "mail", "gmail_app_password", "GMAIL_APP_PASSWORD").replace(" ", "")
 # ★Googleは表示時に4桁区切りでスペースを入れる（例: "abcd efgh ijkl mnop"）。
 #   そのままコピペされる事故が多いため、内部スペースは読み込み時に除去する。
 #   （本来16文字。除去後の長さが16でなければ値そのものが違う可能性が高い）
-MAIL_TO = cfg_get(_CFG, "mail", "mail_to")                 # 当面は個人アドレス推奨(D5据置)
+MAIL_TO = secret(_CFG, "mail", "mail_to", "MAIL_TO")                    # 当面は個人アドレス推奨(D5据置)
 MAIL_SUBJECT = "【Xニュース】"
 
 # ---- LLM(Groq)の設定とレート制限 ----------------------------------------------
-LLM_API_KEY = cfg_get(_CFG, "llm", "api_key")
+LLM_API_KEY = secret(_CFG, "llm", "api_key", "GROQ_API_KEY")
 LLM_MODEL = cfg_get(_CFG, "llm", "model") or LLM_MODEL       # config.iniで上書き可
 # 無料枠の目安: 30リクエスト/分・6,000トークン/分（組織単位・モデル単位）。
 # 上限ちょうどに張り付くと429が多発するので、既定は少し内側に取る。
@@ -178,8 +191,8 @@ ENRICH_BATCH_SIZE = int(cfg_get(_CFG, "llm", "batch_size") or 10)   # config.ini
 #   この2垢だけ捨て垢セッションを使う。取得方法は auth-session-setup.md 参照。
 #   auth_token/ct0 未設定ならこの2垢もゲストへフォールバックする（動作は継続する）。
 AUTH_HANDLES = {"financialjuice", "deitaone"}   # 小文字で比較。ここだけ捨て垢を使う
-X_AUTH_TOKEN = cfg_get(_CFG, "x", "auth_token")
-X_CT0 = cfg_get(_CFG, "x", "ct0")
+X_AUTH_TOKEN = secret(_CFG, "x", "auth_token", "X_AUTH_TOKEN")
+X_CT0 = secret(_CFG, "x", "ct0", "X_CT0")
 
 # ---- 通信部（Slice 0 で実証済み。回転する定数の更新手順は slice0_fetch.py 参照）----
 WEB_BEARER = ("Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4"
@@ -1294,104 +1307,70 @@ def send_mail(subject, html):
         smtp.send_message(msg)
 
 
-def write_db_snapshot(db_path=STORE_PATH, out_path=SNAPSHOT_PATH):
-    """news_log.db を base64 化して data/db_snapshot.js に書き出す。
-    db_viewer.html を file:// で直接開いたときの読み込み元になる
-    （file:// では fetch がブラウザにブロックされるが、<script> の読み込みは通るため）。
-    HTTP経由で開いた場合は常に本物の .db を fetch するので、こちらは使われない。"""
+def build_viewer_items(db_path=STORE_PATH):
+    """news_log(基本情報)とnews_labels(軸ごとの縦持ちラベル)を読み、
+    tweet_idごとに labels:{axis:[値,...]} へ組み立てたリストを返す
+    （db_viewer.html側のJSと同じ形。1軸に複数値があり得るため配列で持つ）。"""
+    with sqlite3.connect(db_path) as c:
+        main = c.execute(
+            "SELECT tweet_id, created_at, source, translation, summary, url "
+            "FROM news_log ORDER BY created_at DESC").fetchall()
+        label_rows = c.execute(
+            "SELECT tweet_id, axis, value FROM news_labels").fetchall()
+    labels_by_id = {}
+    for tid, axis, value in label_rows:
+        if value in (None, ""):
+            continue
+        labels_by_id.setdefault(tid, {}).setdefault(axis, []).append(value)
+    return [{
+        "tweet_id": tid, "created_at": created_at, "source": source,
+        "translation": translation, "summary": summary, "url": url,
+        "labels": labels_by_id.get(tid, {}),
+    } for tid, created_at, source, translation, summary, url in main]
+
+
+def write_viewer_data(db_path=STORE_PATH, out_path=VIEWER_DATA_PATH):
+    """DBの中身をJSONにして data/news_data.js に書き出す。db_viewer.html はサーバ経由の
+    fetchではなく、この<script>ファイルだけを読んで表示する（サーバ廃止・file://直開き化）。
+    file:// では fetch によるローカルファイル読み込みがブロックされるが、
+    <script src> の読み込みは通るため、以前と同じ手法（中身だけJSONに変更）で回避する。"""
     try:
-        with open(db_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
+        items = build_viewer_items(db_path)
         tmp = out_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("// x_collector.py が自動生成（手で編集しない）。\n"
-                    "// db_viewer.html を file:// で開いたとき用の news_log.db スナップショット。\n"
-                    f'window.__NEWS_DB_B64 = "{b64}";\n'
-                    f'window.__NEWS_DB_AT = "{datetime.now(JST).strftime("%Y/%m/%d %H:%M")}";\n')
+                    "// db_viewer.html はこのファイルだけを読む（サーバ不要・file://で直接開ける）。\n"
+                    f"window.__NEWS_ITEMS = {json.dumps(items, ensure_ascii=False)};\n"
+                    f'window.__NEWS_DATA_AT = "{datetime.now(JST).strftime("%Y/%m/%d %H:%M")}";\n')
         os.replace(tmp, out_path)          # アトミック置換（読み込み中の半端なファイルを作らない）
-        # 「書けたつもり」で終わらせず、実際に何件ぶん書いたかを出す
-        try:
-            with sqlite3.connect(db_path) as c:
-                n = c.execute("SELECT COUNT(*) FROM news_log").fetchone()[0]
-                newest = c.execute("SELECT MAX(created_at) FROM news_log").fetchone()[0]
-            print(f"[*] db_snapshot.js を更新: {n} 件（最新 {newest}） "
-                  f"{os.path.getsize(out_path) // 1024}KB")
-        except Exception:
-            pass
+        newest = items[0]["created_at"] if items else "なし"
+        print(f"[*] news_data.js を更新: {len(items)} 件（最新 {newest}） "
+              f"{os.path.getsize(out_path) // 1024}KB")
         return True
     except Exception as e:
-        print(f"[WARN] db_snapshot.js の書き出しに失敗: {e}")
+        print(f"[WARN] news_data.js の書き出しに失敗: {e}")
         return False
 
 
-# 我々のdb_viewer.htmlだと分かる目印。**ファイルの先頭付近に置くこと**
-# （後ろに置くと下の read() に入らず、自分のサーバを「別物」と誤判定して
-#   実行のたびに別ポートでサーバが増える）。
-VIEWER_MARKER = "x-collector-db-viewer"
-
-
-def viewer_server_state(port, fetcher=None):
-    """そのポートの状態を返す: "空き" / "ours"（我々のページを配信中） / "別物"。
-    ★ポートが埋まっている＝我々のサーバ、とは限らない。**古い版のサーバが残っていると
-      旧フォルダを配信し続け、db_viewerが真っ白になる**（実機で疑われた事象）。
-      そこで中身まで確認してから再利用する。"""
-    def default_fetch(url):
-        with urllib.request.urlopen(url, timeout=1.5) as r:
-            return r.status, r.read(2048).decode("utf-8", "replace")   # 目印は先頭にある
-    fetcher = fetcher or default_fetch
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-            pass
-    except OSError:
-        return "空き"
-    try:
-        status, head = fetcher(f"http://127.0.0.1:{port}/web/db_viewer.html")
-    except Exception:
-        return "別物"
-    return "ours" if status == 200 and VIEWER_MARKER in head else "別物"
-
-
-def pick_viewer_port(base=None, tries=10, checker=viewer_server_state):
-    """使うポートを決める。(ポート, 既に我々のサーバが動いているか) を返す。
-    既定ポートが別のプロセスに取られていたら、順に空きを探す（黙って古い物に繋がない）。"""
-    base = base or DB_VIEWER_PORT
-    first_free = None
-    for port in range(base, base + tries):
-        state = checker(port)
-        if state == "ours":
-            return port, True
-        if state == "空き" and first_free is None:
-            first_free = port
-    return first_free, False
-
-
-def ensure_db_viewer_server():
-    """db_viewer.html は file:// で開くと data/news_log.db を自動fetchできない
-    （ブラウザのセキュリティ制約でJSからの任意ローカルファイル読み込みは不可）。
-    プロジェクトルートを配信するだけの最小HTTPサーバ(標準ライブラリ http.server)をバックグラウンドで
-    起動し、ブラウザを開く。既に我々のサーバが動いていれば再起動せず開くだけ
-    （毎日の実行で増殖させない）。別物が居座っていたら別のポートで立て直す。"""
-    port, already = pick_viewer_port()
-    if port is None:
-        print(f"[WARN] {DB_VIEWER_PORT}〜 に空きポートがありません。db_viewerは開きません。")
+def open_db_viewer(viewer_path=None, opener=None):
+    """db_viewer.html を file:// で直接開く（サーバは使わない）。
+    write_viewer_data() を先に呼んでnews_data.jsを最新化してから使うこと。
+    opener を差し替えられるので、実際にブラウザを起動せずに --selftest で検証できる。
+    ★GitHub Actions等のCI環境にはブラウザが無いため、GITHUB_ACTIONS環境変数を見て
+    自動でスキップする（失敗時の[WARN]ログが並ぶのを避け、意図的なスキップだと分かるようにする）。
+    ビューア自体はCloudflare Pages等から見るので、CI側でこれを開けなくても運用上問題ない。"""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print("[*] db_viewer: CI環境のためブラウザでの自動オープンをスキップ"
+              "（Cloudflare Pages等の公開URLから閲覧する運用のため）")
         return
-    if port != DB_VIEWER_PORT and not already:
-        print(f"[WARN] ポート {DB_VIEWER_PORT} は別のプロセスが使用中です。{port} で起動します"
-              f"（古い版のサーバが残っている場合はタスクマネージャーで終了してください）。")
-    if not already:
-        try:
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)   # Windows以外では0(無視)
-            subprocess.Popen(
-                [sys.executable, "-m", "http.server", str(port)],
-                cwd=BASE_DIR, creationflags=flags,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(0.8)   # サーバ起動を少し待つ（軽量サーバなのでこれで十分）
-        except Exception as e:
-            print(f"[WARN] db_viewer用サーバの起動に失敗: {e}")
-            return
-    url = f"http://localhost:{port}/web/db_viewer.html"
+    viewer_path = viewer_path or os.path.join(BASE_DIR, "web", "db_viewer.html")
+    opener = opener or webbrowser.open
+    if not os.path.exists(viewer_path):
+        print(f"[WARN] db_viewer.html が見つかりません: {viewer_path}")
+        return
+    url = "file://" + os.path.abspath(viewer_path).replace(os.sep, "/")
     try:
-        webbrowser.open(url)
+        opener(url)
         print(f"[*] db_viewer を開きました: {url}")
     except Exception as e:
         print(f"[WARN] ブラウザを開けませんでした: {e} / 手動で開いてください: {url}")
@@ -1552,8 +1531,8 @@ def run(do_enrich=True, do_mail=True, argv=None):
             print(f"[*] メール送信 {len(rows)} 件 → {MAIL_TO}")
         except Exception as e:
             print(f"[FAIL] メール送信: {e}")   # データは保存済み。送信失敗で失わない
-        write_db_snapshot()                # file:// で開いた場合用のスナップショットを更新
-        ensure_db_viewer_server()          # ⑥ 送信後（成否問わず）news_log.dbを確認できるようにする
+        write_viewer_data()                 # news_data.js を最新化
+        open_db_viewer()                    # ⑥ 送信後（成否問わず）db_viewer.htmlをfile://で開く
     conn.close()
 
     # F6 失敗検知（黙って欠測しない）
@@ -1961,6 +1940,19 @@ def selftest():
     assert cfg_get(real_cfg, "mail", "gmail_user") == "test@example.com", "config取得値NG"
     assert cfg_get(real_cfg, "x", "ct0") == "", "未設定キーが空文字にならない"
 
+    # secret(): config.ini優先、無ければ環境変数（GitHub Actions運用向け）にフォールバック
+    _env_key = "__XNEWS_SELFTEST_ENV__"
+    os.environ[_env_key] = "from-env"
+    try:
+        assert secret(missing_cfg, "mail", "gmail_user", _env_key) == "from-env", \
+            "secret(): config未設定時に環境変数へフォールバックしない"
+        assert secret(real_cfg, "mail", "gmail_user", _env_key) == "test@example.com", \
+            "secret(): config.iniの値より環境変数が優先されてしまっている"
+        assert secret(missing_cfg, "mail", "no_such_key", "__XNEWS_SELFTEST_NO_SUCH_ENV__") == "", \
+            "secret(): 両方未設定なのに空文字にならない"
+    finally:
+        del os.environ[_env_key]
+
     # アプリパスワードのスペース除去（Google表示の4桁区切りをそのまま貼る事故対策）の回帰チェック
     pw_cfg = configparser.ConfigParser()
     pw_cfg.read_string("[mail]\ngmail_app_password = abcd efgh ijkl mnop\n")
@@ -2025,43 +2017,83 @@ def selftest():
     assert (pages, reason, len(dedup)) == (2, "cursorが進まない", 1), \
         f"cursor停滞の打ち切りNG: {pages}/{reason}"
 
-    # ---- db_viewer用サーバのポート選択 ---------------------------------------
-    # ★「ポートが埋まっている＝我々のサーバ」と決めつけない。古い版のサーバが
-    #   残っていると旧フォルダを配信し続け、db_viewerが真っ白になる。
-    states = {8765: "別物", 8766: "空き", 8767: "ours"}
-    port, already = pick_viewer_port(8765, tries=3, checker=lambda p: states[p])
-    assert (port, already) == (8767, True), f"稼働中の自前サーバを再利用しないNG: {port}/{already}"
-    states2 = {8765: "別物", 8766: "空き", 8767: "空き"}
-    port2, already2 = pick_viewer_port(8765, tries=3, checker=lambda p: states2[p])
-    assert (port2, already2) == (8766, False), f"別物を避けて空きを使わないNG: {port2}"
-    states3 = {8765: "空き", 8766: "空き", 8767: "空き"}
-    assert pick_viewer_port(8765, tries=3, checker=lambda p: states3[p]) == (8765, False), \
-        "空いているのに既定ポートを使わない"
-    states4 = {8765: "別物", 8766: "別物", 8767: "別物"}
-    assert pick_viewer_port(8765, tries=3, checker=lambda p: states4[p]) == (None, False), \
-        "全て埋まっているのにNoneを返さない"
-    # 中身の判定: 200かつ目印があるときだけ "ours"
-    assert viewer_server_state(1, fetcher=lambda u: (_ for _ in ()).throw(OSError())) == "空き"
-    real_port = [None]
-
-    class _Marker:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-    # ポートが開いている状況を作って、本文の中身で判定が変わることを確かめる
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(50)      # 判定のたびに接続するので、待ち行列を十分に取る
-    real_port[0] = srv.getsockname()[1]
+    # ---- db_viewer用データの書き出し（news_data.js。サーバは廃止しfile://直開き）--------
+    import tempfile
+    tmp_db_fd, tmp_db_path = tempfile.mkstemp(suffix=".db")
+    os.close(tmp_db_fd)
+    os.remove(tmp_db_path)          # init_dbが新規作成する形にする（既存ファイル前提にしない）
     try:
-        assert viewer_server_state(real_port[0],
-                                   fetcher=lambda u: (200, f"<div {VIEWER_MARKER}>")) == "ours"
-        assert viewer_server_state(real_port[0], fetcher=lambda u: (200, "別サイト")) == "別物"
-        assert viewer_server_state(real_port[0], fetcher=lambda u: (404, "")) == "別物"
+        conn_v = init_db(sqlite3.connect(tmp_db_path))
+        twv = {"id": "950", "author": "acc", "created_at": recent,
+               "text": "Viewer test tweet", "url": "https://x.com/acc/status/950",
+               "likes": 0, "retweets": 0, "is_rt": False, "is_quote": False}
+        append_rows(conn_v, "acc", [twv])
+        conn_v.execute("UPDATE news_log SET translation=? WHERE tweet_id=?",
+                       ("ビューア用テスト訳", "950"))
+        conn_v.executemany(
+            "INSERT OR REPLACE INTO news_labels (tweet_id, axis, value) VALUES (?,?,?)",
+            [("950", "国・地域", "米国"), ("950", "国・地域", "日本"), ("950", "業界", "金融")])
+        conn_v.commit()
+        conn_v.close()
+
+        # build_viewer_items: news_log+news_labelsをtweet_idごとに組み立てる
+        # （1軸に複数値があり得るので配列で持つ＝db_viewer.html側のJSと同じ形）
+        items = build_viewer_items(tmp_db_path)
+        assert len(items) == 1, f"build_viewer_items件数NG: {len(items)}"
+        it = items[0]
+        assert it["tweet_id"] == "950" and it["translation"] == "ビューア用テスト訳", \
+            f"build_viewer_itemsの内容NG: {it}"
+        assert sorted(it["labels"]["国・地域"]) == ["日本", "米国"], \
+            f"複数値ラベルの組み立てNG: {it['labels']}"
+        assert it["labels"]["業界"] == ["金融"], "単一値ラベルの組み立てNG"
+
+        # write_viewer_data: <script>から読み込めるJS（JSON埋め込み）として書き出す
+        tmp_out = tmp_db_path + ".data.js"
+        assert write_viewer_data(db_path=tmp_db_path, out_path=tmp_out) is True, \
+            "write_viewer_dataが失敗を返した"
+        txt = open(tmp_out, encoding="utf-8").read()
+        assert "window.__NEWS_ITEMS = [" in txt, "news_data.jsの中身がJSON配列になっていない"
+        assert "ビューア用テスト訳" in txt, "news_data.jsに訳文が含まれていない"
+        m = re.search(r"__NEWS_ITEMS = (\[.*\]);", txt, re.S)
+        assert json.loads(m.group(1)) == items, "書き出したJSONを読み直した結果が元と一致しない"
+        os.remove(tmp_out)
+
+        # DBが空でも例外にならない（初回実行＝データ0件でも書き出せる）
+        tmp_db2_fd, tmp_db2_path = tempfile.mkstemp(suffix=".db")
+        os.close(tmp_db2_fd)
+        os.remove(tmp_db2_path)
+        init_db(sqlite3.connect(tmp_db2_path)).close()
+        assert build_viewer_items(tmp_db2_path) == [], "空DBでのbuild_viewer_itemsNG"
+        tmp_out2 = tmp_db2_path + ".data.js"
+        assert write_viewer_data(db_path=tmp_db2_path, out_path=tmp_out2) is True, \
+            "空DBでのwrite_viewer_data失敗"
+        os.remove(tmp_out2)
+        os.remove(tmp_db2_path)
     finally:
-        srv.close()
+        if os.path.exists(tmp_db_path):
+            os.remove(tmp_db_path)
+
+    # open_db_viewer: サーバを起動せず、file://のURLでブラウザを開こうとすること
+    opened = {}
+    open_db_viewer(viewer_path=os.path.join(BASE_DIR, "web", "db_viewer.html"),
+                   opener=lambda u: opened.setdefault("url", u))
+    assert opened.get("url", "").startswith("file://"), f"file://で開いていない: {opened}"
+    assert opened["url"].endswith("db_viewer.html"), f"開いたURLがdb_viewer.htmlでない: {opened}"
+    # 存在しないパスなら、例外にせず警告だけで済ませる（openerは呼ばれない）
+    opened2 = {}
+    open_db_viewer(viewer_path=os.path.join(BASE_DIR, "web", "no_such_file.html"),
+                   opener=lambda u: opened2.setdefault("url", u))
+    assert "url" not in opened2, "存在しないファイルなのにブラウザを開こうとした"
+
+    # GitHub Actions環境(GITHUB_ACTIONS=true)ではブラウザを開こうとせず即スキップすること
+    os.environ["GITHUB_ACTIONS"] = "true"
+    try:
+        opened3 = {}
+        open_db_viewer(viewer_path=os.path.join(BASE_DIR, "web", "db_viewer.html"),
+                       opener=lambda u: opened3.setdefault("url", u))
+        assert "url" not in opened3, "CI環境なのにブラウザを開こうとした"
+    finally:
+        del os.environ["GITHUB_ACTIONS"]
 
     # ---- LLM(Groq)のレート制限とリトライ ------------------------------------
     # 仮想時計＋仮想sleepで検証する（実時間を待たない）
@@ -2394,10 +2426,11 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         selftest()
     elif "--check-viewer" in sys.argv:
-        # db_viewerが表示されないときの切り分け。DB・スナップショット・ポートの3点を見る。
-        import base64 as _b64
+        # db_viewerが表示されないときの切り分け。DB・news_data.js・htmlの3点を見る
+        #（サーバを廃止したので、ポート云々の確認は不要になった）。
+        viewer_html = os.path.join(BASE_DIR, "web", "db_viewer.html")
         print(f"[*] BASE_DIR: {BASE_DIR}")
-        for path in (STORE_PATH, SNAPSHOT_PATH, os.path.join(BASE_DIR, "web", "db_viewer.html")):
+        for path in (STORE_PATH, VIEWER_DATA_PATH, viewer_html):
             print(f"    {'OK ' if os.path.exists(path) else 'なし'} {path}"
                   f" {os.path.getsize(path) // 1024 if os.path.exists(path) else 0}KB")
         if os.path.exists(STORE_PATH):
@@ -2406,29 +2439,18 @@ if __name__ == "__main__":
             newest = c.execute("SELECT MAX(created_at) FROM news_log").fetchone()[0]
             print(f"[*] news_log.db: {n} 件（最新 {newest}）")
             c.close()
-        if os.path.exists(SNAPSHOT_PATH):
-            txt = open(SNAPSHOT_PATH, encoding="utf-8").read()
-            at = re.search(r'__NEWS_DB_AT = "([^"]+)"', txt)
-            b64 = re.search(r'__NEWS_DB_B64 = "([^"]*)"', txt)
+        if os.path.exists(VIEWER_DATA_PATH):
+            txt = open(VIEWER_DATA_PATH, encoding="utf-8").read()
+            at = re.search(r'__NEWS_DATA_AT = "([^"]+)"', txt)
             try:
-                tmp = os.path.join(DATA_DIR, "_check.db")
-                with open(tmp, "wb") as f:
-                    f.write(_b64.b64decode(b64.group(1)))
-                c2 = sqlite3.connect(tmp)
-                sn = c2.execute("SELECT COUNT(*) FROM news_log").fetchone()[0]
-                c2.close()
-                os.remove(tmp)
-                print(f"[*] db_snapshot.js: {sn} 件 / 生成 {at.group(1) if at else '不明'}"
-                      f"  ← file:// で開いたときに見えるデータ")
+                m = re.search(r"__NEWS_ITEMS = (\[.*\]);", txt, re.S)
+                items = json.loads(m.group(1)) if m else []
+                print(f"[*] news_data.js: {len(items)} 件 / 生成 {at.group(1) if at else '不明'}"
+                      f"  ← db_viewer.html が実際に表示するデータ")
             except Exception as e:
-                print(f"[FAIL] db_snapshot.js を読めません: {e}")
-        for port in range(DB_VIEWER_PORT, DB_VIEWER_PORT + 3):
-            st = viewer_server_state(port)
-            note = {"ours": "← このURLで開けます", "別物": "← 別のプロセスが使用中",
-                    "空き": ""}.get(st, "")
-            print(f"[*] ポート {port}: {st} {note}")
-            if st == "ours":
-                print(f"    http://localhost:{port}/web/db_viewer.html")
+                print(f"[FAIL] news_data.js を読めません: {e}")
+        print(f"[*] db_viewer.html は file:// で直接開いてください（サーバは使いません）: "
+              f"file://{os.path.abspath(viewer_html)}")
         print("[*] 画面が空なら、絞り込み条件がブラウザに残っている可能性があります"
               "（db_viewer上部の『フィルタをクリア』）。")
     elif "--list-models" in sys.argv:
