@@ -1,0 +1,18 @@
+// Cloudflare側のビルドログが "Executing user deploy command: npx wrangler deploy" と
+// なっている＝このプロジェクトは（想定していた旧来のPages専用ダッシュボード設定ではなく）
+// 新しい統合後のWorkers上のデプロイ経路を通っている。この経路の wrangler deploy は
+// ダッシュボードの「Build output directory」欄を見ておらず、リポジトリ直下のこの
+// wrangler.jsonc の assets.directory を見て「どこが静的ファイル置き場か」を判断する。
+// このファイルが無かったため "Could not detect a directory containing static files" で
+// 失敗していた（docs/CLOUD_SETUP.md §5・トラブルシューティング参照）。
+//
+// ★ "name" は、Cloudflareダッシュボードで実際に作成されているプロジェクト名と
+//   一致させること（作成時に付けた名前。ダッシュボードの概要ページで確認できる）。
+//   一致していないと、想定と違う名前で新規デプロイされる可能性がある。
+{
+  "name": "xnews-viewer",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "."
+  }
+}

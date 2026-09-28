@@ -384,6 +384,7 @@ python src/x_collector.py
 | `data/news_log.db` | 実行時に自動生成。収集データ本体（SQLite） |
 | `data/news_data.js` | 実行時に自動生成。db_viewer.html が読むJSON（§8） |
 | `.github/workflows/xnews.yml` | GitHub Actionsでの自動実行定義（クラウド運用時のみ使う。§14） |
+| `wrangler.jsonc` | Cloudflareへのデプロイ設定（クラウド運用時のみ使う。`assets.directory`で静的ファイルの場所を指定。§14） |
 | `docs/CLOUD_SETUP.md` | クラウド運用（GitHub Actions + Cloudflare）のセットアップ手順 |
 
 ## 12. 自己テスト
@@ -519,5 +520,9 @@ python src\x_collector.py --check-viewer
   自動でスキップする（§9）。ビューアはCloudflare Pagesの公開URLから見る運用のため。
 - ホスティング先はGitHub PagesではなくCloudflare Pages等を使う。GitHub PagesはPrivate
   リポジトリの無料公開に対応していないため。
+- ★2026年時点のCloudflareは「Pages」であっても実デプロイがWorkers統合後の経路
+  （`wrangler deploy`）を通ることがあり、その場合ダッシュボードの「Build output
+  directory」だけでは足りず、リポジトリ直下の `wrangler.jsonc`（`assets.directory`）で
+  静的ファイルの場所を明示する必要がある（実機で確認。§CLOUD_SETUP.md §5）。
 - アクセス制限（Googleアカウント限定）はCloudflare Access（Zero Trust）側の設定であり、
   アプリケーションコード側には手を入れていない。
