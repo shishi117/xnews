@@ -115,14 +115,17 @@ GitHubのリポジトリ画面 → **Settings** → 左メニュー **Secrets an
    **Connect to Git** で、先ほどのGitHubリポジトリ（xnews）を選ぶ。
    初回はCloudflareにGitHubへのアクセスを許可する画面が出るので許可する。
 2. ビルド設定は次の通り（このプロジェクトはビルド不要な静的ファイルのため）。
-   - **Build command**: 空欄のまま（何も入力しない）
-   - **Build output directory**: `/`（リポジトリのルート。`web/`と`data/`を
-     両方とも同じ相対関係のまま公開する必要があるため）
+   - **Build command**: `exit 0`（空欄のままだとフレームワーク自動検出が走って
+     失敗することがあるため、「何もしない」ことを明示するコマンドを入れる）
+   - **Build output directory**: `.`（リポジトリのルート。`/`ではなく **ドット1文字**。
+     `/`を指定すると `Could not detect a directory containing static files` で
+     デプロイが失敗する。`web/`と`data/`を両方とも同じ相対関係のまま公開する必要が
+     あるため、サブフォルダではなくルート＝`.`を指定する）
 3. **Save and Deploy** を押すとデプロイが始まる。数十秒〜数分で
    `https://xnews-xxxx.pages.dev/web/db_viewer.html` のようなURLが発行される。
 4. 一度アクセスして、ビューアが（現時点ではまだ誰でも見える状態で）正しく
-   表示されることを確認する。表示されない場合は「Build output directory」の
-   指定を見直す。
+   表示されることを確認する。表示されない場合は「Build output directory」が
+   `.`になっているか（`/`のままになっていないか）を見直す。
 5. 以後、GitHub Actionsが`data/news_data.js`等を更新してpushするたびに、
    Cloudflare Pagesが自動で再デプロイする（追加の作業は不要）。
 
@@ -204,7 +207,9 @@ Zero Trust → **Access** → **Applications** → **Add an application** →
 | Actionsの最後のステップで push が失敗する（Permission denied 等） | 手順3の「Workflow permissions」が Read and write になっているか |
 | メールが届かない | Secretsの `GMAIL_USER` / `GMAIL_APP_PASSWORD` / `MAIL_TO` の値、特にアプリパスワードの桁数（16文字）を確認 |
 | financialjuice/DeItaoneが `(guest)` のまま | Secretsの `X_AUTH_TOKEN` / `X_CT0` が正しく登録されているか（`docs/auth-session-setup.md`） |
-| Cloudflare Pagesのビューアが真っ白 | 「Build output directory」が `/` になっているか。`data/news_data.js` がリポジトリに存在し、Actionsが実際にpushしているか |
+| Cloudflare Pagesのデプロイが `Could not detect a directory containing static files` で失敗する | 「Build output directory」に `/` を指定していないか。**`.`（ドット1文字）** に直す |
+| Cloudflare Pagesのビューアが真っ白 | 「Build output directory」が `.` になっているか。`data/news_data.js` がリポジトリに存在し、Actionsが実際にpushしているか |
+| メール送信が `555 5.5.2 Syntax error` で失敗する（Gmail側の分かりにくいエラー） | 原因は大抵 `GMAIL_USER`/`MAIL_TO` の値が「メールアドレスに見えない」こと（全角＠・全角スペース・コピペ時の改行混入・余分なカンマなど）。この不具合を検知して、次回実行時からは代わりに `メール設定の値がメールアドレスの形式に見えません: ...`という具体的なエラーが出るようにした（文字数と原因カテゴリを表示）。そのSecretを一度削除し、余分な文字が入らないよう再登録する |
 | Googleログイン画面が出ずに直接見えてしまう | Accessアプリケーションの「Application domain」がCloudflare Pagesの実際のドメインと一致しているか |
 | Googleログインが失敗する（redirect_uri_mismatch等） | Google Cloud Console側のリダイレクトURIとCloudflareが提示するコールバックURLが完全に一致しているか |
 | リポジトリのサイズが気になってきた | `data/`配下は保持期間(7日)分しか無いため1回あたりは小さいが、pushのたびに履歴が積み上がる。当面は無料枠内で問題ないが、気になれば数か月おきに履歴を整理（squash）してもよい |

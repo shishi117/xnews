@@ -1293,10 +1293,48 @@ def build_html(rows, labels_by_tweet, today):
         '</table></td></tr></table></body></html>')
 
 
+def _looks_like_email(addr):
+    """簡易チェック: ASCIIのみ・空白/改行なし・@がちょうど1つ・@の前後に文字がある。
+    RFC5322の厳密な検証ではなく、事故（全角文字混入・改行混入・コピペミス）の検出が目的。"""
+    if not addr:
+        return False
+    try:
+        addr.encode("ascii")
+    except UnicodeEncodeError:
+        return False           # 全角文字混入（全角＠・全角スペース等）はここで弾く
+    if any(c.isspace() for c in addr):
+        return False           # 改行・空白混入（GitHub Secretsへのコピペミスで起きやすい）
+    if addr.count("@") != 1:
+        return False
+    local, _, domain = addr.partition("@")
+    return bool(local) and bool(domain) and "." in domain
+
+
+def _validate_mail_config():
+    """MAIL_FROM/MAIL_TOが「メールアドレスらしい」形かを事前チェックする。
+    ここで弾かずSMTPへそのまま渡すと、Gmail側で「555 5.5.2 Syntax error」という
+    原因の読み取れないエラーになる（実機で確認）。値そのものはログに出さず、文字数と
+    「何が変か」のカテゴリだけを伝える（GitHub Actionsのログにも安全に出せるように）。"""
+    problems = []
+    if not _looks_like_email(MAIL_FROM):
+        problems.append(f"gmail_user/GMAIL_FROM（{len(MAIL_FROM)}文字）がメールアドレスの"
+                         "形式に見えません（全角文字・空白・改行の混入、@の数を確認）")
+    for part in MAIL_TO.split(","):
+        if not _looks_like_email(part.strip()):
+            problems.append(f"mail_to/MAIL_TO（全体{len(MAIL_TO)}文字）にメールアドレスの"
+                             "形式に見えない要素があります（全角文字・空白・改行の混入、"
+                             "余分なカンマなどを確認）")
+            break
+    if problems:
+        raise RuntimeError("メール設定の値がメールアドレスの形式に見えません: "
+                           + " / ".join(problems))
+
+
 def send_mail(subject, html):
     if not (MAIL_FROM and MAIL_APP_PASSWORD and MAIL_TO):
         raise RuntimeError("メール設定が未設定（config.ini の [mail] セクション: "
                            "gmail_user / gmail_app_password / mail_to を設定）")
+    _validate_mail_config()
     msg = EmailMessage()
     msg["Subject"], msg["From"], msg["To"] = subject, MAIL_FROM, MAIL_TO
     msg.set_content("HTMLメールです。対応クライアントで表示してください。")
@@ -1952,6 +1990,17 @@ def selftest():
             "secret(): 両方未設定なのに空文字にならない"
     finally:
         del os.environ[_env_key]
+
+    # _looks_like_email(): 全角文字混入・空白/改行混入・@の過不足を検出できること
+    # （Gmail側の分かりにくい「555 5.5.2 Syntax error」を防ぐための事前チェック）
+    assert _looks_like_email("user@example.com") is True, "正常なアドレスを弾いてしまう"
+    assert _looks_like_email("user＠example.com") is False, "全角＠を検出できない"
+    assert _looks_like_email("user@example.com\n") is False, "末尾の改行を検出できない"
+    assert _looks_like_email("user @example.com") is False, "空白混入を検出できない"
+    assert _looks_like_email("") is False, "空文字を弾けない"
+    assert _looks_like_email("user@@example.com") is False, "@過多を検出できない"
+    assert _looks_like_email("userexample.com") is False, "@無しを検出できない"
+    assert _looks_like_email("user@examplecom") is False, "ドメインに.が無いのを検出できない"
 
     # アプリパスワードのスペース除去（Google表示の4桁区切りをそのまま貼る事故対策）の回帰チェック
     pw_cfg = configparser.ConfigParser()
