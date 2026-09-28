@@ -1,8 +1,14 @@
-# 秘密情報
+# 秘密情報（絶対にコミットしない。クラウド運用ではGitHub Secretsを使う）
 config/config.ini
 
-# 実行時生成物
-data/
+# 実行時生成物のうち、一時ファイルだけを除外する。
+# ★ローカル専用運用（このリポジトリをGitHub Actionsで動かさない場合）は、
+#   下の3行を "data/" 一行に戻せば以前と同じ「dataは一切コミットしない」構成に戻る。
+# ★GitHub Actionsでクラウド運用する場合は、実行のたびに更新される
+#   data/news_log.db（収集済みデータ）・data/state.json（差分抽出の位置）・
+#   data/news_data.js（ビューア用データ）をリポジトリにコミットして次回実行に引き継ぐ
+#   必要があるため、あえて無視しない（詳細は docs/CLOUD_SETUP.md）。
+data/*.tmp
 
 # 仮想環境
 env/
