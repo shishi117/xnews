@@ -49,7 +49,7 @@ jobs:
           X_AUTH_TOKEN: ${{ secrets.X_AUTH_TOKEN }}
           X_CT0: ${{ secrets.X_CT0 }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: python src/x_collector.py --window 24
+        run: python src/x_collector.py
 
       - name: 収集結果をコミット（次回実行への引き継ぎ・ビューア更新）
         run: |
